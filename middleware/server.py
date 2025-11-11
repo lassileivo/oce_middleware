@@ -195,11 +195,36 @@ async def health_deep():
         return {"status": "degraded", "middleware": "alive", "error": str(e)}
 
 
+# salli valinnainen julkinen warmup (ei pakollinen)
+ALLOW_PUBLIC_WARMUP = os.getenv("ALLOW_PUBLIC_WARMUP", "false").lower() == "true"
+
 @app.post("/warmup")
-async def warmup(_: WarmupPayload, x_action_key: str = Header(None)):
-    check_auth(x_action_key)
-    _ = await oce_health()
-    return {"status": "warmed"}
+async def warmup(payload: WarmupPayload | None = None, x_action_key: str = Header(None)):
+    """
+    Wake middleware (and ping OCE health lightly). Must NEVER return 500.
+    """
+    # auth (ohita jos nimenomaan sallit julkisen warmupin)
+    if not ALLOW_PUBLIC_WARMUP:
+        if x_action_key != ACTION_KEY:
+            raise HTTPException(status_code=401, detail="Unauthorized.")
+
+    # yritä pingata OCE:ta, mutta niele kaikki poikkeukset
+    warning = None
+    if RENDER_OCE_URL:
+        try:
+            _ = await oce_health()
+        except Exception as e:
+            # loggaa, mutta älä riko warmupia
+            warning = f"oce_health failed: {str(e)}"
+
+    # 200 aina; jos oli ongelma, kerrotaan se payloadissa debugia varten
+    body = {"status": "warmed"}
+    if ALLOW_PUBLIC_WARMUP:
+        body["public"] = True
+    if warning:
+        body["warning"] = warning
+    return JSONResponse(status_code=200, content=body)
+
 
 @app.post("/bridge/run")
 async def bridge_run(req: Request, body: RunPayload, x_action_key: str = Header(None)):
