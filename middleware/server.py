@@ -195,35 +195,45 @@ async def health_deep():
         return {"status": "degraded", "middleware": "alive", "error": str(e)}
 
 
-# salli valinnainen julkinen warmup (ei pakollinen)
 ALLOW_PUBLIC_WARMUP = os.getenv("ALLOW_PUBLIC_WARMUP", "false").lower() == "true"
 
 @app.post("/warmup")
-async def warmup(payload: WarmupPayload | None = None, x_action_key: str = Header(None)):
+async def warmup(x_action_key: str = Header(None)):
     """
-    Wake middleware (and ping OCE health lightly). Must NEVER return 500.
+    Lightweight warmup that NEVER returns 500.
+    - Auth by X-Action-Key unless ALLOW_PUBLIC_WARMUP=true
+    - Optionally pings OCE /health (swallows all errors)
     """
-    # auth (ohita jos nimenomaan sallit julkisen warmupin)
-    if not ALLOW_PUBLIC_WARMUP:
-        if x_action_key != ACTION_KEY:
+    try:
+        # Auth
+        if not ALLOW_PUBLIC_WARMUP and x_action_key != ACTION_KEY:
             raise HTTPException(status_code=401, detail="Unauthorized.")
 
-    # yritä pingata OCE:ta, mutta niele kaikki poikkeukset
-    warning = None
-    if RENDER_OCE_URL:
-        try:
-            _ = await oce_health()
-        except Exception as e:
-            # loggaa, mutta älä riko warmupia
-            warning = f"oce_health failed: {str(e)}"
+        warning = None
+        if RENDER_OCE_URL:
+            try:
+                # very light upstream poke; no crash if fails
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    r = await client.get(f"{RENDER_OCE_URL}/health")
+                    r.raise_for_status()
+            except Exception as e:
+                warning = f"oce_health failed: {e}"
 
-    # 200 aina; jos oli ongelma, kerrotaan se payloadissa debugia varten
-    body = {"status": "warmed"}
-    if ALLOW_PUBLIC_WARMUP:
-        body["public"] = True
-    if warning:
-        body["warning"] = warning
-    return JSONResponse(status_code=200, content=body)
+        body = {"status": "warmed"}
+        if ALLOW_PUBLIC_WARMUP:
+            body["public"] = True
+        if warning:
+            body["warning"] = warning
+
+        return JSONResponse(status_code=200, content=body)
+
+    except HTTPException:
+        # anna auth-virheiden mennä läpi oikealla koodilla
+        raise
+    except Exception as e:
+        # viimeinen turvaverkko: EI 500:aa
+        return JSONResponse(status_code=200, content={"status": "warmed", "warning": f"internal: {e}"})
+
 
 
 @app.post("/bridge/run")
