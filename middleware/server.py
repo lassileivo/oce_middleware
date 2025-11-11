@@ -183,17 +183,16 @@ def manifest():
 
 @app.get("/health")
 async def health():
+    # Älä koske OCE:en – palauta vain middleware-liveness.
+    return {"status": "ok", "middleware": "alive"}
+
+@app.get("/health/deep")
+async def health_deep():
     try:
-        oce = None
-        if RENDER_OCE_URL:
-            try:
-                oce = await oce_health()
-            except Exception as e:
-                oce = {"status": "degraded", "error": str(e)}
+        oce = await oce_health()
         return {"status": "ok", "middleware": "alive", "oce": oce}
     except Exception as e:
-        return {"status": "ok", "middleware": "alive", "error": str(e)}
-
+        return {"status": "degraded", "middleware": "alive", "error": str(e)}
 
 
 @app.post("/warmup")
