@@ -1,64 +1,99 @@
-openapi: 3.0.1
+openapi: 3.1.1
 info:
   title: OCE Middleware
-  version: "0.1.0"
+  version: "0.1.1"
 servers:
-  - url: https://<YOUR-MIDDLEWARE-ONRENDER-URL>
+  - url: https://oce-middleware.onrender.com
+
+components:
+  securitySchemes:
+    ActionKey:
+      type: apiKey
+      in: header
+      name: X-Action-Key
+  schemas:
+    SessionCtx:
+      type: object
+      required: [project_id]
+      properties:
+        project_id:
+          type: string
+          description: Opaque session/project id scoped by middleware.
+        mcda:
+          type: object
+          additionalProperties: true
+        risk:
+          type: object
+          additionalProperties: true
+        meta:
+          type: object
+          additionalProperties: true
+    RunRequest:
+      type: object
+      required: [user_text, session_ctx]
+      properties:
+        user_text:
+          type: string
+        session_ctx:
+          $ref: '#/components/schemas/SessionCtx'
+
 paths:
   /health:
     get:
       operationId: health
       summary: Health check for middleware and OCE upstream
       responses:
-        "200": { description: OK }
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+
   /warmup:
     post:
       operationId: warmup
       summary: Wake underlying OCE service (cold start)
-      parameters:
-        - in: header
-          name: X-Action-Key
-          required: true
-          schema: { type: string }
+      security:
+        - ActionKey: []
       requestBody:
         content:
           application/json:
             schema:
               type: object
               properties:
-                project_id: { type: string }
+                project_id:
+                  type: string
       responses:
-        "200": { description: Warmed }
+        "200":
+          description: Warmed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
         "401": { description: Unauthorized }
+
   /bridge/run:
     post:
       operationId: bridgeRun
       summary: Route a user request to OCE with safe shaping
-      parameters:
-        - in: header
-          name: X-Action-Key
-          required: true
-          schema: { type: string }
+      security:
+        - ActionKey: []
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              type: object
-              required: [user_text, session_ctx]
-              properties:
-                user_text: { type: string }
-                session_ctx:
-                  type: object
-                  required: [project_id]
-                  properties:
-                    project_id: { type: string }
-                    mcda: { type: object }
-                    risk: { type: object }
-                    meta: { type: object }
+              $ref: '#/components/schemas/RunRequest'
       responses:
-        "200": { description: OCE response }
+        "200":
+          description: OCE response
+          content:
+            application/json:
+              schema:
+                type: object
         "401": { description: Unauthorized }
         "429": { description: Rate limited }
         "502": { description: Upstream error }
-components: {}
