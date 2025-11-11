@@ -1,0 +1,64 @@
+openapi: 3.0.1
+info:
+  title: OCE Middleware
+  version: "0.1.0"
+servers:
+  - url: https://<YOUR-MIDDLEWARE-ONRENDER-URL>
+paths:
+  /health:
+    get:
+      operationId: health
+      summary: Health check for middleware and OCE upstream
+      responses:
+        "200": { description: OK }
+  /warmup:
+    post:
+      operationId: warmup
+      summary: Wake underlying OCE service (cold start)
+      parameters:
+        - in: header
+          name: X-Action-Key
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                project_id: { type: string }
+      responses:
+        "200": { description: Warmed }
+        "401": { description: Unauthorized }
+  /bridge/run:
+    post:
+      operationId: bridgeRun
+      summary: Route a user request to OCE with safe shaping
+      parameters:
+        - in: header
+          name: X-Action-Key
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_text, session_ctx]
+              properties:
+                user_text: { type: string }
+                session_ctx:
+                  type: object
+                  required: [project_id]
+                  properties:
+                    project_id: { type: string }
+                    mcda: { type: object }
+                    risk: { type: object }
+                    meta: { type: object }
+      responses:
+        "200": { description: OCE response }
+        "401": { description: Unauthorized }
+        "429": { description: Rate limited }
+        "502": { description: Upstream error }
+components: {}
