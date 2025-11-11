@@ -184,15 +184,17 @@ def manifest():
 @app.get("/health")
 async def health():
     try:
-        # "ok" even if OCE is down; report it in payload
         oce = None
-        try:
-            oce = await oce_health()
-        except Exception as e:
-            oce = {"status":"degraded","error":str(e)}
+        if RENDER_OCE_URL:
+            try:
+                oce = await oce_health()
+            except Exception as e:
+                oce = {"status": "degraded", "error": str(e)}
         return {"status": "ok", "middleware": "alive", "oce": oce}
     except Exception as e:
-        return {"status":"ok", "middleware":"alive", "error": str(e)}
+        return {"status": "ok", "middleware": "alive", "error": str(e)}
+
+
 
 @app.post("/warmup")
 async def warmup(_: WarmupPayload, x_action_key: str = Header(None)):
