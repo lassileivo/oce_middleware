@@ -1,7 +1,10 @@
 openapi: 3.1.0
 info:
   title: OCE Middleware
-  version: "0.2.0"
+  version: "0.2.1"
+
+servers:
+  - url: /   https://oce-middleware.onrender.com
 
 components:
   securitySchemes:
@@ -14,65 +17,45 @@ components:
       type: object
       required: [project_id]
       properties:
-        project_id:
-          type: string
-          description: Opaque session/project id scoped by middleware.
-        user_id:
-          type: string
-          description: Optional stable user identifier (opaque).
-        message_id:
-          type: string
-          description: Optional message id for traceability.
-        mcda:
-          type: object
-          additionalProperties: true
-        risk:
-          type: object
-          additionalProperties: true
-        meta:
-          type: object
-          additionalProperties: true
+        project_id: { type: string }
+        user_id: { type: string }
+        message_id: { type: string }
+        mcda: { type: object, additionalProperties: true }
+        risk: { type: object, additionalProperties: true }
+        meta: { type: object, additionalProperties: true }
+
     RunRequest:
       type: object
       required: [user_text, session_ctx]
       properties:
-        user_text:
-          type: string
+        user_text: { type: string }
         session_ctx:
           $ref: '#/components/schemas/SessionCtx'
+
     HealthResponse:
       type: object
-      required: [status]
+      required: [status, middleware]
       properties:
-        status:
-          type: string
-          enum: [ok, degraded]
-        middleware:
-          type: string
-        oce:
-          type: object
-          additionalProperties: true
-        error:
-          type: string
+        status: { type: string, enum: [ok, degraded] }
+        middleware: { type: string }
+        oce: { type: object, additionalProperties: true }
+        error: { type: string }
+
     WarmupResponse:
       type: object
       required: [status]
       properties:
-        status:
-          type: string
-          enum: [warmed]
+        status: { type: string, enum: [warmed] }
+        public: { type: boolean }
+        warning: { type: string }
+
     OCEBridgeResponse:
       type: object
       description: OCE upstream payload plus middleware-added assistant_text.
       properties:
-        text:
-          type: string
-        json_summary:
-          type: object
-          additionalProperties: true
-        telemetry:
-          type: object
-          additionalProperties: true
+        text: { type: string }
+        json_summary: { type: object, additionalProperties: true }
+        telemetry: { type: object, additionalProperties: true }
         assistant_text:
           type: string
           description: Human-readable short answer produced by middleware.
@@ -82,7 +65,19 @@ paths:
   /health:
     get:
       operationId: health
-      summary: Health check for middleware and OCE upstream
+      summary: Lightweight middleware liveness
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /health/deep:
+    get:
+      operationId: healthDeep
+      summary: Check upstream OCE health (manual only)
       responses:
         "200":
           description: OK
@@ -94,7 +89,7 @@ paths:
   /warmup:
     post:
       operationId: warmup
-      summary: Wake underlying OCE service (cold start)
+      summary: Wake middleware; optional ping to OCE
       security:
         - ActionKey: []
       requestBody:
@@ -102,8 +97,7 @@ paths:
           application/json:
             schema:
               type: object
-              properties:
-                project_id: { type: string }
+              additionalProperties: true
       responses:
         "200":
           description: Warmed
@@ -116,7 +110,7 @@ paths:
   /bridge/run:
     post:
       operationId: bridgeRun
-      summary: Route a user request to OCE with safe shaping and add assistant_text
+      summary: Route a user request to OCE with safe shaping; returns assistant_text
       security:
         - ActionKey: []
       requestBody:
@@ -129,10 +123,8 @@ paths:
         "200":
           description: OCE response with assistant_text
           headers:
-            X-Request-ID:
-              schema: { type: string }
-            X-Memory-Check:
-              schema: { type: string, enum: ["ok","fail"] }
+            X-Request-ID: { schema: { type: string } }
+            X-Memory-Check: { schema: { type: string, enum: ["ok","fail"] } }
           content:
             application/json:
               schema:
@@ -140,3 +132,4 @@ paths:
         "401": { description: Unauthorized }
         "429": { description: Rate limited }
         "502": { description: Upstream error }
+

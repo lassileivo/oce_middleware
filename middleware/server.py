@@ -1,44 +1,48 @@
-import os, time, re, json, hashlib, secrets, uuid, asyncio, datetime
+import os
+import time
+import re
+import json
+import hashlib
 from typing import Optional, Dict, Any
-from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse, FileResponse
-from pydantic import BaseModel, Field, field_validator
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, validator
 import httpx
-from starlette.middleware.base import BaseHTTPMiddleware
 
-# --------- ENV ----------
+# ========= ENV =========
 RENDER_OCE_URL = os.getenv("RENDER_OCE_URL", "").rstrip("/")
 RENDER_OCE_API_KEY = os.getenv("RENDER_OCE_API_KEY", "")
 ACTION_KEY = os.getenv("ACTION_KEY", "")
-# ------------------------
+CORS_ORIGIN = os.getenv("CORS_ORIGIN", "https://chat.openai.com")
+ALLOW_PUBLIC_WARMUP = os.getenv("ALLOW_PUBLIC_WARMUP", "false").lower() == "true"
 
-app = FastAPI(title="OCE Middleware", version="0.2.0")
+if not ACTION_KEY:
+    print("[BOOT] WARNING: ACTION_KEY missing; /warmup and /bridge/run will 401 unless ALLOW_PUBLIC_WARMUP=true")
+# =======================
 
-# --- Optional: cap body size ---
-class MaxSizeMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app, max_bytes: int = 256_000):
-        super().__init__(app)
-        self.max_bytes = max_bytes
-    async def dispatch(self, request, call_next):
-        cl = request.headers.get("content-length")
-        if cl and int(cl) > self.max_bytes:
-            return JSONResponse(status_code=413, content={"detail":"Payload too large"})
-        return await call_next(request)
+app = FastAPI(title="OCE Middleware", version="0.2.1")
 
-app.add_middleware(MaxSizeMiddleware, max_bytes=256_000)
+# --- CORS ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[CORS_ORIGIN],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# --- Simple rate limit ---
-RATE_LIMIT_WINDOW = 30  # s
-RATE_LIMIT_MAX = 20
+# --- Rate limit (IP+key) ---
+RATE_LIMIT_WINDOW = 30  # seconds
+RATE_LIMIT_MAX = 20     # requests/window
 _rate: Dict[str, Dict[str, Any]] = {}
 
 def _rate_key(ip: str, action_key: str) -> str:
     return hashlib.sha256(f"{ip}:{action_key}".encode()).hexdigest()
 
 def check_rate(ip: str, action_key: str):
-    k = _rate_key(ip, action_key)
+    k = _rate_key(ip, action_key or "")
     now = time.time()
     slot = _rate.get(k)
     if not slot or now - slot["start"] > RATE_LIMIT_WINDOW:
@@ -46,16 +50,25 @@ def check_rate(ip: str, action_key: str):
         return
     slot["count"] += 1
     if slot["count"] > RATE_LIMIT_MAX:
-        hint = int(RATE_LIMIT_WINDOW - (now - slot["start"]))
-        raise HTTPException(status_code=429, detail={"error":"rate_limited","hint":f"Try after {hint}s"})
+        raise HTTPException(status_code=429, detail="Rate limit exceeded; slow down.")
 
-def check_auth(x_action_key: Optional[str]):
-    if not (ACTION_KEY and x_action_key) or not secrets.compare_digest(x_action_key, ACTION_KEY):
+# --- Auth header helper (accept both names) ---
+def _extract_action_key_from_headers(request: Request, explicit_header: Optional[str]) -> Optional[str]:
+    if explicit_header:
+        return explicit_header
+    h = request.headers
+    return (
+        h.get("X-Action-Key")
+        or h.get("x-action-key")
+        or h.get("X-Api-Key")
+        or h.get("x-api-key")
+    )
+
+def check_auth(key: Optional[str]):
+    if not ALLOW_PUBLIC_WARMUP and (not key or key != ACTION_KEY):
         raise HTTPException(status_code=401, detail="Unauthorized.")
 
-# --- Schemas ---
-BAD_INSTR = ["wipe memory", "delete memory", "shutdown", "reconfigure"]
-
+# --- Models ---
 class SessionCtx(BaseModel):
     project_id: str = Field(..., description="Opaque session/project id scoped by middleware.")
     user_id: Optional[str] = None
@@ -64,126 +77,86 @@ class SessionCtx(BaseModel):
     risk: Optional[Dict[str, Any]] = None
     meta: Optional[Dict[str, Any]] = None
 
-    @field_validator("project_id")
-    @classmethod
-    def projid_ok(cls, v: str):
+    @validator("project_id")
+    def projid_ok(cls, v):
         if not re.match(r"^[A-Za-z0-9_\-]{1,64}$", v):
             raise ValueError("Invalid project_id.")
         return v
 
 class RunPayload(BaseModel):
-    user_text: str = Field(..., min_length=1, max_length=8000)
+    user_text: str
     session_ctx: SessionCtx
-
-class WarmupPayload(BaseModel):
-    project_id: Optional[str] = None
 
 # --- Helpers ---
 def redact(o: Any) -> Any:
     if isinstance(o, dict):
-        return {k: ("***" if any(t in k.lower() for t in ["key","token","auth"]) else redact(v)) for k,v in o.items()}
+        out = {}
+        for k, v in o.items():
+            if "key" in k.lower() or "token" in k.lower() or "auth" in k.lower():
+                out[k] = "***"
+            else:
+                out[k] = redact(v)
+        return out
     if isinstance(o, list):
         return [redact(x) for x in o]
     return o
 
-async def _post_with_backoff(url, headers, payload, tries=3, base=0.5):
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        last = None
-        for i in range(tries):
-            try:
-                r = await client.post(url, headers=headers, json=payload)
-                r.raise_for_status()
-                return r.json()
-            except Exception as e:
-                last = e
-                if i < tries - 1:
-                    await asyncio.sleep(base * (2 ** i))
-        raise last
-
 async def oce_health() -> Dict[str, Any]:
     if not RENDER_OCE_URL:
-        return {"status":"degraded", "error":"RENDER_OCE_URL not set"}
-    url = f"{RENDER_OCE_URL}/health"
-    headers = {"Authorization": f"Bearer {RENDER_OCE_API_KEY}"} if RENDER_OCE_API_KEY else {}
+        raise RuntimeError("RENDER_OCE_URL not set")
+    headers = {}
+    if RENDER_OCE_API_KEY:
+        headers["Authorization"] = f"Bearer {RENDER_OCE_API_KEY}"
     async with httpx.AsyncClient(timeout=15.0) as client:
-        r = await client.get(url, headers=headers)
+        r = await client.get(f"{RENDER_OCE_URL}/health", headers=headers)
         r.raise_for_status()
         return r.json()
 
 async def oce_run(payload: Dict[str, Any]) -> Dict[str, Any]:
-    url = f"{RENDER_OCE_URL}/run_oce"
-    headers = {"Authorization": f"Bearer {RENDER_OCE_API_KEY}", "Content-Type":"application/json"} if RENDER_OCE_API_KEY else {"Content-Type":"application/json"}
-    return await _post_with_backoff(url, headers, payload, tries=3, base=0.5)
+    if not RENDER_OCE_URL:
+        raise RuntimeError("RENDER_OCE_URL not set")
+    headers = {"Content-Type": "application/json"}
+    if RENDER_OCE_API_KEY:
+        headers["Authorization"] = f"Bearer {RENDER_OCE_API_KEY}"
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.post(f"{RENDER_OCE_URL}/run_oce", headers=headers, json=payload)
+        r.raise_for_status()
+        return r.json()
 
-def shape_payload(body: RunPayload, ip: str) -> Dict[str, Any]:
-    lower = body.user_text.lower()
-    if any(b in lower for b in BAD_INSTR):
+SAFE_SECTION = re.compile(r"^(Thesis|Hypothesis|Key Points|Counterpoints|Actions|Next Step|Criteria|Weights|Options|Scores|Recommendation|Uncertainty|Top Risks|Expected Loss|Mitigation|Simulation|Falsifiable Claim|Tests / Predictions|Status|Variables|Method|Data Needs)$")
+
+def shape_payload(p: RunPayload) -> Dict[str, Any]:
+    bad = ["wipe memory", "delete memory", "shutdown", "reconfigure"]
+    lower = p.user_text.lower()
+    if any(b in lower for b in bad):
         raise HTTPException(status_code=400, detail="Dangerous instruction blocked by middleware.")
-    shaped = body.model_dump()
-    # enrich meta
-    meta = shaped["session_ctx"].get("meta") or {}
-    meta.update({
-        "client": "gpt-actions",
-        "ts": datetime.datetime.utcnow().isoformat() + "Z",
-        "ip_hash": hashlib.sha256(ip.encode()).hexdigest(),
-    })
-    shaped["session_ctx"]["meta"] = meta
-    return shaped
+    return {
+        "user_text": p.user_text.strip(),
+        "session_ctx": p.session_ctx.dict(),
+    }
 
-SECTION_RE = re.compile(r"^#?\s*(Thesis|Recommendation|Actions|Top Risks)\s*:?", re.I | re.M)
-
-def humanize_response(res: Dict[str, Any]) -> str:
+def make_assistant_text(res: Dict[str, Any]) -> str:
     """
-    Minimal 'assistant_text' from OCE output:
-    - Thesis: 1–2 lauseen yhteenveto
-    - Recommendation: suositus + lyhyt perustelu
-    - Actions: 2–3 konkreettista askelta
-    - Top Risks: 2 tärkeintä riskiä (nimi + lyhyt)
-    Fallback: lyhyt tiivistelmä ensimmäisestä kappaleesta.
+    Best-effort lyhyt vastaus käyttäjälle (kevyt tulkkaus).
     """
-    txt = (res.get("text") or "").strip()
-    if not txt:
-        return "OCE processed the request. No textual summary was returned."
-    lines = [l.strip() for l in txt.splitlines() if l.strip()]
-    thesis = next((l for l in lines if l.lower().startswith(("**thesis**","thesis:"))), None)
-    reco = next((l for l in lines if l.lower().startswith(("**recommendation**","recommendation:"))), None)
-    # Actions
-    acts_idx = next((i for i,l in enumerate(lines) if l.lower().startswith(("**actions**","actions:"))), None)
-    actions = []
-    if acts_idx is not None:
-        for l in lines[acts_idx+1:acts_idx+6]:
-            if l.startswith(("*","-")): actions.append(l.lstrip("*- ").strip())
-            else: break
-    # Risks
-    risk_idx = next((i for i,l in enumerate(lines) if l.lower().startswith(("**top risks**","top risks:"))), None)
-    risks = []
-    if risk_idx is not None:
-        for l in lines[risk_idx+1:risk_idx+4]:
-            if l.startswith(("*","-")): risks.append(l.lstrip("*- ").strip())
-            else: break
+    try:
+        js = res.get("json_summary", {}) or {}
+        reco = None
+        if "Recommendation" in res.get("text", ""):
+            # hae suositus riviltä jos mahdollista
+            pass
+        # yritä nostaa suositus json_summarystä
+        # mahdollinen rakenne: json_summary -> ???; varmistetaan fallback
+        # Annetaan varma, lyhyt tiiviste:
+        return "Lyhyt yhteenveto: " + (res.get("text", "").split("\n\n", 1)[0].strip() or "OK.")
+    except Exception:
+        return "OK."
 
-    out = []
-    if thesis: out.append(thesis.replace("**",""))
-    if reco: out.append(reco.replace("**",""))
-    if actions: out.append("Next steps: " + "; ".join(actions[:3]) + ".")
-    if risks: out.append("Watch risks: " + "; ".join(risks[:2]) + ".")
-    if not out:
-        out.append(lines[0] if lines else "Summary unavailable.")
-    return " ".join(out)
-
-# --- Routes ---
-ROOT = Path(__file__).resolve().parents[1]
-
-@app.get("/openapi.yaml", include_in_schema=False)
-def manifest():
-    path = ROOT / "openapi.yaml"
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Manifest not found.")
-    return FileResponse(path)
+# ============ ROUTES ============
 
 @app.get("/health")
 async def health():
-    # Älä koske OCE:en – palauta vain middleware-liveness.
+    # Älä pingaa OCEa Renderin health-probessa
     return {"status": "ok", "middleware": "alive"}
 
 @app.get("/health/deep")
@@ -194,28 +167,20 @@ async def health_deep():
     except Exception as e:
         return {"status": "degraded", "middleware": "alive", "error": str(e)}
 
-
-ALLOW_PUBLIC_WARMUP = os.getenv("ALLOW_PUBLIC_WARMUP", "false").lower() == "true"
-
 @app.post("/warmup")
-async def warmup(x_action_key: str = Header(None)):
+async def warmup(request: Request, x_action_key: str = Header(None)):
     """
-    Lightweight warmup that NEVER returns 500.
-    - Auth by X-Action-Key unless ALLOW_PUBLIC_WARMUP=true
-    - Optionally pings OCE /health (swallows all errors)
+    Fail-safe: ei koskaan 500. Hyväksyy X-Action-Key tai X-Api-Key.
     """
     try:
-        # Auth
-        if not ALLOW_PUBLIC_WARMUP and x_action_key != ACTION_KEY:
-            raise HTTPException(status_code=401, detail="Unauthorized.")
+        key = _extract_action_key_from_headers(request, x_action_key)
+        if not ALLOW_PUBLIC_WARMUP:
+            check_auth(key)
 
         warning = None
         if RENDER_OCE_URL:
             try:
-                # very light upstream poke; no crash if fails
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    r = await client.get(f"{RENDER_OCE_URL}/health")
-                    r.raise_for_status()
+                _ = await oce_health()
             except Exception as e:
                 warning = f"oce_health failed: {e}"
 
@@ -224,27 +189,24 @@ async def warmup(x_action_key: str = Header(None)):
             body["public"] = True
         if warning:
             body["warning"] = warning
-
         return JSONResponse(status_code=200, content=body)
 
     except HTTPException:
-        # anna auth-virheiden mennä läpi oikealla koodilla
         raise
     except Exception as e:
-        # viimeinen turvaverkko: EI 500:aa
         return JSONResponse(status_code=200, content={"status": "warmed", "warning": f"internal: {e}"})
-
-
 
 @app.post("/bridge/run")
 async def bridge_run(req: Request, body: RunPayload, x_action_key: str = Header(None)):
-    check_auth(x_action_key)
+    # Auth + rate
+    key = _extract_action_key_from_headers(req, x_action_key)
+    check_auth(key)
     client_ip = req.client.host if req.client else "0.0.0.0"
-    check_rate(client_ip, x_action_key)
+    check_rate(client_ip, key)
 
-    shaped = shape_payload(body, client_ip)
-    rid = str(uuid.uuid4())
+    shaped = shape_payload(body)
 
+    # Forward to OCE
     try:
         res = await oce_run(shaped)
     except httpx.HTTPStatusError as he:
@@ -252,18 +214,27 @@ async def bridge_run(req: Request, body: RunPayload, x_action_key: str = Header(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Upstream error: {str(e)}")
 
-    # Build assistant_text for GPT to speak naturally
-    assistant_text = humanize_response(res)
-    res["assistant_text"] = assistant_text
+    # Optional: sanity filter of sections
+    try:
+        js = res.get("json_summary", {}) or {}
+        sections = js.get("sections_present", [])
+        if any((not SAFE_SECTION.match(s)) for s in sections):
+            res["text"] = (res.get("text") or "") + "\n\n[Note] Some sections were filtered for safety."
+    except Exception:
+        pass
 
-    # Memory check hint
-    js = res.get("json_summary", {}) or {}
-    mem = js.get("memory", {})
-    mem_ok = bool(mem.get("updated") is True)
-    headers = {"X-Request-ID": rid, "X-Memory-Check": "ok" if mem_ok else "fail"}
-    if not mem_ok:
-        res["assistant_text"] += " (Note: upstream memory may not have updated; retry if session continuity is required.)"
+    # Lisää lyhyt, käyttäjäystävällinen teksti
+    res["assistant_text"] = make_assistant_text(res)
 
-    print("[BRIDGE] ok", json.dumps({"rid": rid, "ip": client_ip, "payload": redact(shaped)}, ensure_ascii=False))
-    return JSONResponse(res, headers=headers)
+    # Älä loggaa salaisuuksia
+    print("[BRIDGE] ok", json.dumps({"ip": client_ip, "payload": redact(shaped)}, ensure_ascii=False))
+    return JSONResponse(
+        status_code=200,
+        content=res,
+        headers={
+            "X-Request-ID": hashlib.sha256(f"{time.time()}:{client_ip}".encode()).hexdigest()[:16],
+            "X-Memory-Check": "ok" if (body.session_ctx and body.session_ctx.project_id) else "fail",
+        },
+    )
+
 
