@@ -1,73 +1,18 @@
-openapi: 3.1.0
+openapi: 3.1.1
 info:
   title: OCE Middleware
-  version: "0.2.1"
+  version: "0.2.3"
 
 servers:
-  - url: /   https://oce-middleware.onrender.com
-
-components:
-  securitySchemes:
-    ActionKey:
-      type: apiKey
-      in: header
-      name: X-Action-Key
-  schemas:
-    SessionCtx:
-      type: object
-      required: [project_id]
-      properties:
-        project_id: { type: string }
-        user_id: { type: string }
-        message_id: { type: string }
-        mcda: { type: object, additionalProperties: true }
-        risk: { type: object, additionalProperties: true }
-        meta: { type: object, additionalProperties: true }
-
-    RunRequest:
-      type: object
-      required: [user_text, session_ctx]
-      properties:
-        user_text: { type: string }
-        session_ctx:
-          $ref: '#/components/schemas/SessionCtx'
-
-    HealthResponse:
-      type: object
-      required: [status, middleware]
-      properties:
-        status: { type: string, enum: [ok, degraded] }
-        middleware: { type: string }
-        oce: { type: object, additionalProperties: true }
-        error: { type: string }
-
-    WarmupResponse:
-      type: object
-      required: [status]
-      properties:
-        status: { type: string, enum: [warmed] }
-        public: { type: boolean }
-        warning: { type: string }
-
-    OCEBridgeResponse:
-      type: object
-      description: OCE upstream payload plus middleware-added assistant_text.
-      properties:
-        text: { type: string }
-        json_summary: { type: object, additionalProperties: true }
-        telemetry: { type: object, additionalProperties: true }
-        assistant_text:
-          type: string
-          description: Human-readable short answer produced by middleware.
-      additionalProperties: true
+  - url: https://oce-middleware.onrender.com
 
 paths:
   /health:
     get:
       operationId: health
-      summary: Lightweight middleware liveness
+      summary: Liveness check
       responses:
-        "200":
+        '200':
           description: OK
           content:
             application/json:
@@ -77,10 +22,10 @@ paths:
   /health/deep:
     get:
       operationId: healthDeep
-      summary: Check upstream OCE health (manual only)
+      summary: Deep health incl. upstream OCE status
       responses:
-        "200":
-          description: OK
+        '200':
+          description: OK or degraded
           content:
             application/json:
               schema:
@@ -89,28 +34,29 @@ paths:
   /warmup:
     post:
       operationId: warmup
-      summary: Wake middleware; optional ping to OCE
+      summary: Warm underlying OCE service (cold start)
       security:
         - ActionKey: []
       requestBody:
+        required: false
         content:
           application/json:
             schema:
-              type: object
-              additionalProperties: true
+              $ref: '#/components/schemas/WarmupRequest'
       responses:
-        "200":
+        '200':
           description: Warmed
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/WarmupResponse'
-        "401": { description: Unauthorized }
+        '401':
+          description: Unauthorized
 
   /bridge/run:
     post:
       operationId: bridgeRun
-      summary: Route a user request to OCE with safe shaping; returns assistant_text
+      summary: Route user request to OCE and add assistant_text
       security:
         - ActionKey: []
       requestBody:
@@ -120,16 +66,120 @@ paths:
             schema:
               $ref: '#/components/schemas/RunRequest'
       responses:
-        "200":
+        '200':
           description: OCE response with assistant_text
           headers:
-            X-Request-ID: { schema: { type: string } }
-            X-Memory-Check: { schema: { type: string, enum: ["ok","fail"] } }
+            X-Request-ID:
+              schema:
+                type: string
+            X-Memory-Check:
+              schema:
+                type: string
+                enum:
+                  - ok
+                  - fail
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/OCEBridgeResponse'
-        "401": { description: Unauthorized }
-        "429": { description: Rate limited }
-        "502": { description: Upstream error }
+        '401':
+          description: Unauthorized
+        '429':
+          description: Rate limited
+        '502':
+          description: Upstream error
+
+components:
+  securitySchemes:
+    ActionKey:
+      type: apiKey
+      in: header
+      name: X-Action-Key
+
+  schemas:
+    WarmupRequest:
+      type: object
+      properties:
+        project_id:
+          type: string
+
+    SessionCtx:
+      type: object
+      required:
+        - project_id
+      properties:
+        project_id:
+          type: string
+          description: Opaque project/session id
+        user_id:
+          type: string
+        message_id:
+          type: string
+        mcda:
+          type: object
+          additionalProperties: true
+        risk:
+          type: object
+          additionalProperties: true
+        meta:
+          type: object
+          additionalProperties: true
+
+    RunRequest:
+      type: object
+      required:
+        - user_text
+        - session_ctx
+      properties:
+        user_text:
+          type: string
+        session_ctx:
+          $ref: '#/components/schemas/SessionCtx'
+
+    HealthResponse:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum:
+            - ok
+            - degraded
+        middleware:
+          type: string
+        oce:
+          type: object
+          additionalProperties: true
+        error:
+          type: string
+
+    WarmupResponse:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum:
+            - warmed
+        warning:
+          type: string
+
+    OCEBridgeResponse:
+      type: object
+      properties:
+        text:
+          type: string
+        json_summary:
+          type: object
+          additionalProperties: true
+        telemetry:
+          type: object
+          additionalProperties: true
+        assistant_text:
+          type: string
+      additionalProperties: true
+
+
 
